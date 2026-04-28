@@ -1,0 +1,154 @@
+name: Build MLC Android APK for S24 Ultra
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  JAVA_VERSION: "17"
+  ANDROID_PLATFORM: "android-34"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  NDK_VERSION: "28.0.12433566"
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout MLC source repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1" \
+            "platform-tools"
+
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            unzip \
+            ninja-build \
+            build-essential \
+            ccache
+
+      - name: Install MLC Python package
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --pre -U mlc-llm mlc-ai-nightly -f https://mlc.ai/wheels
+
+      - name: Export build environment
+        shell: bash
+        run: |
+          echo "MLC_LLM_SOURCE_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+          echo "TVM_SOURCE_DIR=${GITHUB_WORKSPACE}/3rdparty/tvm" >> $GITHUB_ENV
+          echo "TVM_NDK_CC=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> $GITHUB_ENV
+          echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Verify repo layout
+        shell: bash
+        run: |
+          test -d android/MLCChat
+          test -f android/MLCChat/gradlew
+          test -f android/MLCChat/mlc-package-config.json
+          test -d 3rdparty/tvm
+
+      - name: Write device-targeted Android model config
+        shell: bash
+        run: |
+          cat > android/MLCChat/mlc-package-config.json <<'JSON'
+          {
+            "device": "android",
+            "model_list": [
+              {
+                "model": "HF://mlc-ai/Llama-3.2-3B-Instruct-q4f16_0-MLC",
+                "model_id": "Llama-3.2-3B-Instruct-q4f16_0-MLC",
+                "estimated_vram_bytes": 4679979417,
+                "overrides": {
+                  "prefill_chunk_size": 128
+                }
+              }
+            ]
+          }
+          JSON
+
+      - name: Package Android runtime and model libs
+        working-directory: android/MLCChat
+        shell: bash
+        run: |
+          python -m mlc_llm package
+          test -f dist/lib/mlc4j/build.gradle
+          test -f dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
+          test -f dist/lib/mlc4j/output/tvm4j_core.jar
+          test -f dist/lib/mlc4j/src/main/assets/mlc-app-config.json
+
+      - name: Force ARM64 only
+        shell: bash
+        run: |
+          if ! grep -q 'abiFilters "arm64-v8a"' android/MLCChat/app/build.gradle; then
+            perl -0pi -e 's/defaultConfigs*{/
+defaultConfig {
+        ndk { abiFilters "arm64-v8a" }
+/s' android/MLCChat/app/build.gradle
+          fi
+
+      - name: Build debug APK
+        working-directory: android/MLCChat
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleDebug
+
+      - name: Verify 16 KB APK alignment
+        shell: bash
+        run: |
+          APK=android/MLCChat/app/build/outputs/apk/debug/app-debug.apk
+          ZIPALIGN=$(find "$ANDROID_SDK_ROOT/build-tools" -name zipalign | sort | tail -n 1)
+          "$ZIPALIGN" -c -P 16 -v 4 "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlc-s24-ultra-llama32-3b-debug-apk
+          path: android/MLCChat/app/build/outputs/apk/debug/app-debug.apk
