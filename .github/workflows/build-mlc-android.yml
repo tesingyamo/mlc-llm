@@ -123,16 +123,6 @@ jobs:
           test -f dist/lib/mlc4j/output/tvm4j_core.jar
           test -f dist/lib/mlc4j/src/main/assets/mlc-app-config.json
 
-      - name: Force ARM64 only
-        shell: bash
-        run: |
-          if ! grep -q 'abiFilters "arm64-v8a"' android/MLCChat/app/build.gradle; then
-            perl -0pi -e 's/defaultConfigs*{/
-defaultConfig {
-        ndk { abiFilters "arm64-v8a" }
-/s' android/MLCChat/app/build.gradle
-          fi
-
       - name: Build debug APK
         working-directory: android/MLCChat
         shell: bash
